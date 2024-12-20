@@ -25,6 +25,7 @@ from typing import Any, Deque
 
 import cv2
 import numpy as np
+import math
 import rclpy
 import tf2_geometry_msgs  # noqa
 from cv_bridge import CvBridge
@@ -53,6 +54,8 @@ from tf2_ros import TransformException  # type: ignore
 from tf2_ros import Time
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
+from tf2_ros import TransformBroadcaster
+from geometry_msgs.msg import TransformStamped
 
 
 class Localizer(Node, ABC):
@@ -253,6 +256,13 @@ class ArucoMarkerLocalizer(PoseLocalizer):
             qos_profile_sensor_data,
         )
 
+         # Publisher to send the image with detected markers
+        self.image_pub = self.create_publisher(
+            Image,
+            "/camera/image_with_markers",
+            qos_profile_sensor_data,
+        )
+
     def get_camera_info_cb(self, info: CameraInfo) -> None:
         """Get the camera info from the camera.
 
@@ -277,18 +287,23 @@ class ArucoMarkerLocalizer(PoseLocalizer):
         for tag_type in self.ARUCO_MARKER_TYPES:
             aruco_dict = cv2.aruco.Dictionary_get(tag_type)
             aruco_params = cv2.aruco.DetectorParameters_create()
+            aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            # Create the ArUco detector with the desired dictionary and parameters
+            # aruco_dict = cv2.aruco.getPredefinedDictionary(tag_type)
+            # aruco_params = cv2.aruco.DetectorParameters()
+            # aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 
             try:
-                # Return the corners and ids if we find the correct tag type
                 corners, ids, _ = cv2.aruco.detectMarkers(
-                    frame, aruco_dict, parameters=aruco_params
-                )
+                    frame, aruco_dict, parameters=aruco_params)
+                # Detect markers in the frame
+                # corners, ids, _ = aruco_detector.detectMarkers(frame)
 
-                if len(ids) > 0:
+                if ids is not None and len(ids) > 0:
                     return corners, ids
 
-            except Exception:
-                continue
+            except Exception as e:
+                print(f"Error during marker detection: {e}")
 
         # Nothing was found
         return None
@@ -329,15 +344,62 @@ class ArucoMarkerLocalizer(PoseLocalizer):
         ]
 
         min_side_idx = side_lengths.index(max(side_lengths))
-        min_marker_id = ids[min_side_idx]
+        # min_marker_id = int(ids[min_side_idx])
+        min_marker_id = int(0)
 
-        camera_matrix = np.array(self.camera_info.k, dtype=np.float64).reshape(3, 4)
+        camera_matrix = np.array(self.camera_info.k, dtype=np.float64).reshape(3, 3)
         projection_matrix = np.array(self.camera_info.d, dtype=np.float64).reshape(1, 5)
 
         # Get the estimated pose
-        rot_vec, trans_vec, _ = cv2.aruco.estimatePoseSingleMarkers(
-            corners[min_side_idx], min_marker_id, camera_matrix, projection_matrix
-        )
+        # marker_size = 0.5
+        marker_size = 0.5
+        marker_points = np.array([[-marker_size / 2.0, marker_size / 2.0, 0],
+                                [marker_size / 2.0, marker_size / 2.0, 0],
+                                [marker_size / 2.0, -marker_size / 2.0, 0],
+                                [-marker_size / 2.0, -marker_size / 2.0, 0]], dtype=np.float32)
+
+        # rot_vec, trans_vec, _ = cv2.aruco.estimatePoseSingleMarkers(
+        #     corners[min_side_idx], marker_size, camera_matrix, projection_matrix
+        # )
+        # solvePnP returns the rotation and translation vectors
+        retval, rot_vec, trans_vec = cv2.solvePnP(objectPoints=marker_points, imagePoints=corners[min_side_idx],
+                                                  cameraMatrix=camera_matrix, distCoeffs=projection_matrix,
+                                                  flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        rot_vec = rot_vec.reshape(3, 1)
+        trans_vec = trans_vec.reshape(3, 1)
+
+        # ------------------------------------------------------------------------------------------------------------
+        # Define a rotation matrix to fix the pose
+        # R_correction = np.array([
+        #     [0, 0, 1],
+        #     [0, 1, 0],
+        #     [-1, 0, 0]
+        # ], dtype=np.float32)
+        R_correction = np.array([
+            [0, 0, 1],
+            [0, -1, 0],
+            [1, 0, 0]
+        ], dtype=np.float32)
+
+        # Convert rvec to a rotation matrix
+        R_marker, _ = cv2.Rodrigues(rot_vec)
+
+        # Apply the correction
+        R_fixed = R_marker @ R_correction
+
+        # Convert back to rvec
+        rot_vec, _ = cv2.Rodrigues(R_fixed)
+        # ------------------------------------------------------------------------------------------------------------
+
+        # Draw detected markers on the frame
+        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+        cv2.drawFrameAxes(frame, camera_matrix, projection_matrix, rot_vec, trans_vec, 0.5, 5)
+        # Publish the image with detected markers
+        try:
+            ros_image = self.bridge.cv2_to_imgmsg(frame, encoding="rgb8")
+            self.image_pub.publish(ros_image)
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish image: {str(e)}")
 
         return rot_vec, trans_vec, min_marker_id
 
@@ -438,15 +500,34 @@ class ArucoMarkerLocalizer(PoseLocalizer):
             ]
         )
 
+        # Swap
+        # swap_axes_mat = np.array([
+        #     [0,  0,  -1,  -.21],  # x
+        #     [0,  1,  0,  0],  # y
+        #     [1,  0,  0,  .067],  # z
+        #     [0,  0,  0,  1],  # homogeneous coordinate unchanged
+        # ])
+        swap_axes_mat = np.array([
+            [ 0,  0, 1, 0],  # x
+            [ 1, 0, 0, 0],  # y
+            [0,  1, 0, 0],  # z
+            [ 0,  0, 0, 1],  # homogeneous coordinate unchanged
+        ], dtype=np.float32)
+
         # Calculate the new transform
-        tf_map_to_base_mat = tf_camera_to_base_mat @ tf_map_to_camera_mat
+        # tf_map_to_base_mat = tf_camera_to_base_mat @ tf_map_to_camera_mat
+
+        # Calculate the new transform with the axis swap
+        tf_map_to_base_mat = swap_axes_mat @ tf_camera_to_base_mat @ tf_map_to_camera_mat
 
         # Update the pose using the new transform
         (
             pose.pose.position.x,  # type: ignore
             pose.pose.position.y,  # type: ignore
             pose.pose.position.z,  # type: ignore
-        ) = tf_map_to_base_mat[3:, 3]
+        ) = tf_map_to_base_mat[:3, 3]
+
+        pose.pose.position.z = -pose.pose.position.z
 
         (
             pose.pose.orientation.x,  # type: ignore
@@ -455,7 +536,42 @@ class ArucoMarkerLocalizer(PoseLocalizer):
             pose.pose.orientation.w,  # type: ignore
         ) = R.from_matrix(tf_map_to_base_mat[:3, :3]).as_quat()
 
+        # Euler angle format in radians
+        roll_x, pitch_y, yaw_z = self.euler_from_quaternion(
+            pose.pose.orientation.x, pose.pose.orientation.y,
+            pose.pose.orientation.z, pose.pose.orientation.w)
+        print(f"X: {pose.pose.position.x} | Y: {pose.pose.position.y} | Z: {pose.pose.position.z}")
+        print(f"radians - roll_x: {roll_x} | pitch_y: {pitch_y} | yaw_z: {yaw_z}")
+        roll_x = math.degrees(roll_x)
+        pitch_y = math.degrees(pitch_y)
+        yaw_z = math.degrees(yaw_z)
+        print(f"degrees - roll_x: {roll_x} | pitch_y: {pitch_y} | yaw_z: {yaw_z}")
+
+        # print(f'pose: {pose}')
+
         self.state = pose
+
+    def euler_from_quaternion(self, x, y, z, w):
+        """
+        Convert a quaternion into euler angles (roll, pitch, yaw)
+        roll is rotation around x in radians (counterclockwise)
+        pitch is rotation around y in radians (counterclockwise)
+        yaw is rotation around z in radians (counterclockwise)
+        """
+        t0 = +2.0 * (w * x + y * z)
+        t1 = +1.0 - 2.0 * (x * x + y * y)
+        roll_x = math.atan2(t0, t1)
+            
+        t2 = +2.0 * (w * y - z * x)
+        t2 = +1.0 if t2 > +1.0 else t2
+        t2 = -1.0 if t2 < -1.0 else t2
+        pitch_y = math.asin(t2)
+            
+        t3 = +2.0 * (w * z + x * y)
+        t4 = +1.0 - 2.0 * (y * y + z * z)
+        yaw_z = math.atan2(t3, t4)
+            
+        return roll_x, pitch_y, yaw_z # in radians
 
 
 class QualisysLocalizer(PoseLocalizer):

@@ -10,14 +10,17 @@ mavros:
       - vision*
       - local*
       - global_position
+      - local_position
 
 mavros_node:
   ros__parameters:
-    fcu_url: "tcp://localhost"
-    gcs_url: "udp://@localhost:14550"
+    fcu_url: "udp://:14550@127.0.0.1:14549"
+    gcs_url: "udp://:14549@127.0.0.1:14548"
+    # fcu_url: "tcp://localhost"
+    # gcs_url: "udp://@localhost:14550"
 
 mavros/local_position:
   ros__parameters:
     frame_id: "map"
     tf:
-      send: false
+      send: true

@@ -32,7 +32,7 @@ def generate_launch_description() -> LaunchDescription:
         Node(
             package="tf2_ros",
             executable="static_transform_publisher",
-            name="marker_00_to_map_tf_broadcaster",
+            name="marker_0_to_map_tf_broadcaster",
             arguments=[
                 "--x",
                 "0.0",
@@ -41,18 +41,18 @@ def generate_launch_description() -> LaunchDescription:
                 "--z",
                 "0.0",
                 "--roll",
-                "0",
+                "-1.57",
                 "--pitch",
-                "0",
+                "3.14",
                 "--yaw",
-                "0",
+                "-1.57",
                 "--frame-id",
                 "map",
                 "--child-frame-id",
-                "marker_00",
+                "marker_0",
             ],
             output="both",
-        )
+        ),
     ]
 
     return LaunchDescription(nodes)
